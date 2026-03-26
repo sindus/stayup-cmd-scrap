@@ -229,9 +229,10 @@ class TestScrapePage:
 class TestProcessProfile:
     """Unit tests for process_profile — all external calls are mocked."""
 
+    _url = "https://blog.example.com"
+
     def _make_config(self, max_scraps=None):
         cfg = {
-            "page": "https://blog.example.com",
             "articles_selector": "a.post",
             "content_selector": "article",
         }
@@ -250,7 +251,7 @@ class TestProcessProfile:
         mock_is_scraped.return_value = False
         mock_scrape.return_value = "Article content"
 
-        process_profile(conn, 1, self._make_config(), datetime.now(tz=timezone.utc))
+        process_profile(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
 
         mock_scrape.assert_called_once_with("https://blog.example.com/post-1", "article")
         conn.commit.assert_called()
@@ -265,7 +266,7 @@ class TestProcessProfile:
         mock_links.return_value = ["https://blog.example.com/post-1", "https://blog.example.com/post-2"]
         mock_is_scraped.return_value = True  # Both are already in DB
 
-        process_profile(conn, 1, self._make_config(), datetime.now(tz=timezone.utc))
+        process_profile(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
 
         mock_scrape.assert_not_called()
 
@@ -280,7 +281,7 @@ class TestProcessProfile:
         mock_is_scraped.return_value = False
         mock_scrape.return_value = "Content"
 
-        process_profile(conn, 1, self._make_config(max_scraps=3), datetime.now(tz=timezone.utc))
+        process_profile(conn, 1, self._url, self._make_config(max_scraps=3), datetime.now(tz=timezone.utc))
 
         assert mock_scrape.call_count == 3
 
@@ -295,7 +296,7 @@ class TestProcessProfile:
         mock_is_scraped.return_value = False
         mock_scrape.return_value = None  # Selector found nothing
 
-        process_profile(conn, 1, self._make_config(), datetime.now(tz=timezone.utc))
+        process_profile(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
 
         # An error row should have been inserted (save_error calls cursor.execute)
         assert cursor.execute.call_count >= 1
@@ -307,7 +308,7 @@ class TestProcessProfile:
         conn, cursor = make_conn_mock()
         mock_links.side_effect = Exception("connection timeout")
 
-        process_profile(conn, 1, self._make_config(), datetime.now(tz=timezone.utc))
+        process_profile(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
 
         # save_error must have been called
         assert cursor.execute.call_count >= 1
@@ -326,7 +327,7 @@ class TestProcessProfile:
         mock_is_scraped.return_value = False
         mock_scrape.side_effect = [Exception("timeout"), "Content of post 2"]
 
-        process_profile(conn, 1, self._make_config(), datetime.now(tz=timezone.utc))
+        process_profile(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
 
         # Second article was still scraped despite first failing
         assert mock_scrape.call_count == 2
