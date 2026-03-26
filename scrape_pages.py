@@ -6,13 +6,14 @@ For each profile, the script fetches the listing page, extracts article URLs usi
 configured CSS selector, and scrapes each article until one is found that already exists
 in the database or the per-run limit is reached.
 
-Expected profile config shape:
-  {
-    "page":               "https://blog.example.com",        # listing page URL
-    "articles_selector":  "h2.post-title a",                 # CSS selector for article links
-    "content_selector":   "article.post-content",            # CSS selector for article body (optional, default: "body")
-    "max_scraps":         20                                  # per-run limit (optional, default: MAX_SCRAPS_PER_RUN)
-  }
+Profile table columns:
+  url     TEXT   — listing page URL to scrape
+  config  JSONB  — scraping options:
+    {
+      "articles_selector":  "h2.post-title a",       # CSS selector for article links
+      "content_selector":   "article.post-content",  # CSS selector for article body (optional, default: "body")
+      "max_scraps":         20                        # per-run limit (optional, default: MAX_SCRAPS_PER_RUN)
+    }
 """
 
 from __future__ import annotations
@@ -30,7 +31,8 @@ from bs4 import BeautifulSoup
 DDL = """
 CREATE TABLE IF NOT EXISTS profile (
     id          SERIAL PRIMARY KEY,
-    config      JSONB NOT NULL UNIQUE,
+    url         TEXT NOT NULL UNIQUE,
+    config      JSONB NOT NULL DEFAULT '{}',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -85,10 +87,10 @@ def init_db(conn: psycopg2.extensions.connection) -> None:
     conn.commit()
 
 
-def get_profiles(conn: psycopg2.extensions.connection) -> list[tuple[int, dict]]:
-    """Return all profiles as a list of (id, config) tuples."""
+def get_profiles(conn: psycopg2.extensions.connection) -> list[tuple[int, str, dict]]:
+    """Return all profiles as a list of (id, url, config) tuples."""
     with conn.cursor() as cur:
-        cur.execute("SELECT id, config FROM profile ORDER BY id")
+        cur.execute("SELECT id, url, config FROM profile ORDER BY id")
         return cur.fetchall()
 
 
@@ -183,6 +185,7 @@ def scrape_page(page_url: str, css_path: str) -> str | None:
 def process_profile(
     conn: psycopg2.extensions.connection,
     profile_id: int,
+    page: str,
     config: dict,
     executed_at: datetime,
 ) -> None:
@@ -195,7 +198,6 @@ def process_profile(
     Errors on individual articles are logged but do not stop the run.
     """
     try:
-        page = config["page"]
         articles_selector = config["articles_selector"]
         content_selector = config.get("content_selector", "body")
         max_scraps = int(config.get("max_scraps", MAX_SCRAPS_PER_RUN))
@@ -230,7 +232,7 @@ def process_profile(
 
     except Exception as e:
         save_error(conn, profile_id, str(e), executed_at)
-        print(f"[{config.get('page', '?')}] Error: {e}", file=sys.stderr)
+        print(f"[{page}] Error: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +252,8 @@ def main() -> None:
 
         executed_at = datetime.now(tz=timezone.utc)
 
-        for profile_id, config in profiles:
-            process_profile(conn, profile_id, config, executed_at)
+        for profile_id, url, config in profiles:
+            process_profile(conn, profile_id, url, config, executed_at)
 
     finally:
         conn.close()
