@@ -1,21 +1,40 @@
 # stayup-cmd-scrap
 
-Monitors web pages by scraping CSS-selected content and storing results in PostgreSQL.
+Scrapes blog articles from pages defined in the `profile` table and stores results in PostgreSQL.
 
-On each run the script fetches every profile from the database, scrapes the element
-at the configured CSS path, and persists the result. The three most recent entries
-per profile are kept.
+On each run the script fetches all profiles, retrieves the article links on the listing page,
+and scrapes each article until one is already in the database or the per-run limit is reached.
 
 ## How it works
 
-Pages to monitor are stored directly in the `profile` table as JSON configs:
+1. Fetch the blog listing page and extract article URLs using `articles_selector`.
+2. For each URL (newest first), stop if the article is already in `connector_scrap` (dedup by URL).
+3. Scrape the article content using `content_selector` and save it to `connector_scrap`.
+4. Stop after `max_scraps` articles (default: 50) to avoid runaway scraping.
+
+Profiles are stored directly in the `profile` table as JSON configs:
 
 ```sql
 INSERT INTO profile (config)
-VALUES ('{"page": "https://example.com", "path": "main article"}');
+VALUES ('{
+  "page": "https://blog.example.com",
+  "articles_selector": "h2.post-title a",
+  "content_selector": "article.post-content",
+  "max_scraps": 20
+}');
 ```
 
-Each run scrapes all profiles and inserts a new row into `connector_scrap`.
+| Config key           | Required | Description                                                  |
+|----------------------|----------|--------------------------------------------------------------|
+| `page`               | yes      | URL of the blog listing page                                 |
+| `articles_selector`  | yes      | CSS selector for article `<a>` links on the listing page     |
+| `content_selector`   | no       | CSS selector for article body (default: `"body"`)            |
+| `max_scraps`         | no       | Max articles scraped per run (default: `50`)                 |
+
+Each scraped article is stored as a row in `connector_scrap` with:
+- `content` — extracted text
+- `params` — snapshot of the config + the article `url`
+
 Errors are logged to the `log` table.
 
 ## Database schema
@@ -23,14 +42,14 @@ Errors are logged to the `log` table.
 ```
 profile
   id          SERIAL PK
-  config      JSONB UNIQUE   -- {"page": "...", "path": "..."}
+  config      JSONB UNIQUE   -- {"page": "...", "articles_selector": "...", ...}
   created_at  TIMESTAMPTZ
 
 connector_scrap
   id          SERIAL PK
   provider_id → profile.id
-  content     TEXT           -- scraped text content
-  params      JSONB          -- snapshot of the profile config used
+  content     TEXT           -- scraped article text
+  params      JSONB          -- {"url": "<article url>", ...config}
   executed_at TIMESTAMPTZ
   success     BOOLEAN
 
@@ -51,9 +70,9 @@ cp .env.example .env
 
 docker compose up db -d
 
-# Add a page to monitor
+# Add a blog to scrape
 docker compose exec db psql -U <DB_USER> -d <DB_NAME> -c \
-  "INSERT INTO profile (config) VALUES ('{\"page\": \"https://example.com\", \"path\": \"main\"}');"
+  "INSERT INTO profile (config) VALUES ('{\"page\": \"https://blog.example.com\", \"articles_selector\": \"h2 a\", \"content_selector\": \"article\"}');"
 
 # Run the scraper
 docker compose run --rm scrape_pages
@@ -87,22 +106,11 @@ To configure: **Settings → Secrets and variables → Actions → New repositor
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt
+# Lint + tests via Docker (recommended)
+docker compose run --rm --entrypoint sh scrape_pages -c "ruff check . && black --check ."
+docker compose run --rm test
 
-# Lint
-ruff check .
-black --check .
-
-# Tests (unit only, no DB required)
-pytest tests/test_unit.py -v
-
-# All tests (requires PostgreSQL)
-DB_HOST=localhost DB_NAME=stayup DB_USER=stayup DB_PASSWORD=stayup pytest tests/ -v
-```
-
-### Pre-commit hook
-
-```bash
+# Pre-commit hook
 cp scripts/pre-commit .git/hooks/pre-commit
 chmod +x .git/hooks/pre-commit
 ```

@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
-Stayup — scrapes web pages defined in the profile table and stores results in PostgreSQL.
+Stayup — scrapes blog articles defined in the profile table and stores results in PostgreSQL.
 
-On each run the script fetches all profiles from the database, scrapes the page
-at the CSS selector path stored in the profile config, and persists the result.
-The three most recent entries per profile are kept.
+For each profile, the script fetches the listing page, extracts article URLs using the
+configured CSS selector, and scrapes each article until one is found that already exists
+in the database or the per-run limit is reached.
+
+Expected profile config shape:
+  {
+    "page":               "https://blog.example.com",        # listing page URL
+    "articles_selector":  "h2.post-title a",                 # CSS selector for article links
+    "content_selector":   "article.post-content",            # CSS selector for article body (optional, default: "body")
+    "max_scraps":         20                                  # per-run limit (optional, default: MAX_SCRAPS_PER_RUN)
+  }
 """
 
 from __future__ import annotations
@@ -13,6 +21,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from urllib.parse import urljoin
 
 import psycopg2
 import requests
@@ -42,8 +51,8 @@ CREATE TABLE IF NOT EXISTS log (
 );
 """
 
-# Maximum number of scrape entries kept per profile.
-MAX_ENTRIES_PER_PROFILE = 3
+# Default maximum number of articles scraped per profile per run.
+MAX_SCRAPS_PER_RUN = 50
 
 
 # ---------------------------------------------------------------------------
@@ -102,25 +111,6 @@ def save_entry(
     conn.commit()
 
 
-def cleanup_old_entries(conn: psycopg2.extensions.connection, profile_id: int) -> None:
-    """Delete scrape entries beyond the MAX_ENTRIES_PER_PROFILE most recent ones."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            DELETE FROM connector_scrap
-            WHERE provider_id = %s
-              AND id NOT IN (
-                SELECT id FROM connector_scrap
-                WHERE provider_id = %s
-                ORDER BY executed_at DESC
-                LIMIT %s
-              )
-            """,
-            (profile_id, profile_id, MAX_ENTRIES_PER_PROFILE),
-        )
-    conn.commit()
-
-
 def save_error(
     conn: psycopg2.extensions.connection,
     profile_id: int | None,
@@ -139,9 +129,36 @@ def save_error(
     conn.commit()
 
 
+def is_article_scraped(conn: psycopg2.extensions.connection, profile_id: int, article_url: str) -> bool:
+    """Return True if this article URL was already scraped for the given profile."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM connector_scrap WHERE provider_id = %s AND params->>'url' = %s LIMIT 1",
+            (profile_id, article_url),
+        )
+        return cur.fetchone() is not None
+
+
 # ---------------------------------------------------------------------------
 # Scraping
 # ---------------------------------------------------------------------------
+
+
+def get_article_links(page_url: str, articles_selector: str) -> list[str]:
+    """Fetch a listing page and return absolute URLs of all elements matching articles_selector.
+
+    Elements must have an href attribute (typically <a> tags).
+    Relative hrefs are resolved against page_url.
+    """
+    resp = requests.get(page_url, timeout=30, headers={"User-Agent": "stayup-scrap/1.0"})
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "lxml")
+    links = []
+    for element in soup.select(articles_selector):
+        href = element.get("href")
+        if href:
+            links.append(urljoin(page_url, href))
+    return links
 
 
 def scrape_page(page_url: str, css_path: str) -> str | None:
@@ -169,22 +186,51 @@ def process_profile(
     config: dict,
     executed_at: datetime,
 ) -> None:
-    """Scrape one profile and persist the result.
+    """Scrape blog articles for one profile and persist new results.
 
-    After saving, old entries beyond MAX_ENTRIES_PER_PROFILE are pruned.
-    Any exception is caught, logged to the `log` table, and printed to stderr.
+    For each article URL found on the listing page:
+      - Stop if the article URL already exists in the database (duplicate boundary reached).
+      - Stop if the per-run scrape limit is reached.
+    Any exception during listing-page fetch is caught, logged, and printed to stderr.
+    Errors on individual articles are logged but do not stop the run.
     """
     try:
-        content = scrape_page(config["page"], config["path"])
-        if content is None:
-            raise RuntimeError(f"No element found at path: {config['path']}")
+        page = config["page"]
+        articles_selector = config["articles_selector"]
+        content_selector = config.get("content_selector", "body")
+        max_scraps = int(config.get("max_scraps", MAX_SCRAPS_PER_RUN))
 
-        save_entry(conn, profile_id, content, config, executed_at)
-        cleanup_old_entries(conn, profile_id)
+        article_urls = get_article_links(page, articles_selector)
+
+        scraped_count = 0
+        for url in article_urls:
+            if scraped_count >= max_scraps:
+                break
+
+            if is_article_scraped(conn, profile_id, url):
+                break  # Already in DB — no need to go further back
+
+            try:
+                content = scrape_page(url, content_selector)
+                if content is None:
+                    save_error(
+                        conn,
+                        profile_id,
+                        f"No element found at selector '{content_selector}' on {url}",
+                        executed_at,
+                    )
+                    continue
+
+                save_entry(conn, profile_id, content, {"url": url, **config}, executed_at)
+                scraped_count += 1
+
+            except Exception as e:
+                save_error(conn, profile_id, f"Error scraping {url}: {e}", executed_at)
+                print(f"[{url}] Error: {e}", file=sys.stderr)
 
     except Exception as e:
         save_error(conn, profile_id, str(e), executed_at)
-        print(f"[{config['page']}] Error: {e}", file=sys.stderr)
+        print(f"[{config.get('page', '?')}] Error: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
