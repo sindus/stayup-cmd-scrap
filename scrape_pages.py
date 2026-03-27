@@ -34,6 +34,7 @@ DDL = """
 CREATE TABLE IF NOT EXISTS repository (
     id          SERIAL PRIMARY KEY,
     url         TEXT NOT NULL UNIQUE,
+    type        TEXT NOT NULL,
     config      JSONB NOT NULL DEFAULT '{}',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -90,9 +91,9 @@ def init_db(conn: psycopg2.extensions.connection) -> None:
 
 
 def get_repositories(conn: psycopg2.extensions.connection) -> list[tuple[int, str, dict]]:
-    """Return all repositories as a list of (id, url, config) tuples."""
+    """Return repositories of type 'scrap' as a list of (id, url, config) tuples."""
     with conn.cursor() as cur:
-        cur.execute("SELECT id, url, config FROM repository ORDER BY id")
+        cur.execute("SELECT id, url, config FROM repository WHERE type = 'scrap' ORDER BY id")
         return cur.fetchall()
 
 

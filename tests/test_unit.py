@@ -62,6 +62,7 @@ class TestGetRepositories:
         get_repositories(conn)
         sql = cursor.execute.call_args[0][0]
         assert "repository" in sql
+        assert "scrap" in sql
 
 
 class TestSaveEntry:

@@ -63,12 +63,12 @@ def db_conn():
     conn.close()
 
 
-def insert_repository(conn, url: str, config: dict) -> int:
+def insert_repository(conn, url: str, config: dict, type: str = "scrap") -> int:
     """Helper: insert a repository and return its id."""
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO repository (url, config) VALUES (%s, %s) RETURNING id",
-            (url, json.dumps(config)),
+            "INSERT INTO repository (url, type, config) VALUES (%s, %s, %s) RETURNING id",
+            (url, type, json.dumps(config)),
         )
         row = cur.fetchone()
     conn.commit()
@@ -110,6 +110,13 @@ class TestGetRepositoriesFunctional:
         repositories = get_repositories(db_conn)
         assert len(repositories) == 2
         assert repositories[0][0] < repositories[1][0]
+
+    def test_returns_only_scrap_type(self, db_conn):
+        insert_repository(db_conn, "https://blog.example.com/scrap", make_config(), type="scrap")
+        insert_repository(db_conn, "https://blog.example.com/other", make_config(), type="other")
+        repositories = get_repositories(db_conn)
+        assert len(repositories) == 1
+        assert repositories[0][1] == "https://blog.example.com/scrap"
 
 
 # ---------------------------------------------------------------------------
