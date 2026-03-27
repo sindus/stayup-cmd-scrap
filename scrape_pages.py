@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Stayup — scrapes blog articles defined in the profile table and stores results in PostgreSQL.
+Stayup — scrapes blog articles defined in the repository table and stores results in PostgreSQL.
 
-For each profile, the script fetches the listing page, extracts article URLs using the
-configured CSS selector, and scrapes each article until one is found that already exists
-in the database or the per-run limit is reached.
+For each repository, the script fetches the listing page and extracts article URLs:
+  - If no articles exist yet for this repository: saves only the latest article.
+  - Otherwise: saves new articles (newest first) until a known article is found,
+    up to MAX_SCRAPS_PER_RUN articles per run.
 
-Profile table columns:
+A cleanup step removes connector_scrap entries older than 15 days.
+
+Repository table columns:
   url     TEXT   — listing page URL to scrape
   config  JSONB  — scraping options:
     {
       "articles_selector":  "h2.post-title a",       # CSS selector for article links
       "content_selector":   "article.post-content",  # CSS selector for article body (optional, default: "body")
-      "max_scraps":         20                        # per-run limit (optional, default: MAX_SCRAPS_PER_RUN)
     }
 """
 
@@ -29,7 +31,7 @@ import requests
 from bs4 import BeautifulSoup
 
 DDL = """
-CREATE TABLE IF NOT EXISTS profile (
+CREATE TABLE IF NOT EXISTS repository (
     id          SERIAL PRIMARY KEY,
     url         TEXT NOT NULL UNIQUE,
     config      JSONB NOT NULL DEFAULT '{}',
@@ -38,7 +40,7 @@ CREATE TABLE IF NOT EXISTS profile (
 
 CREATE TABLE IF NOT EXISTS connector_scrap (
     id          SERIAL PRIMARY KEY,
-    provider_id INTEGER NOT NULL REFERENCES profile(id),
+    repository_id INTEGER NOT NULL REFERENCES repository(id),
     content     TEXT NOT NULL,
     params      JSONB NOT NULL,
     executed_at TIMESTAMPTZ NOT NULL,
@@ -47,14 +49,14 @@ CREATE TABLE IF NOT EXISTS connector_scrap (
 
 CREATE TABLE IF NOT EXISTS log (
     id          SERIAL PRIMARY KEY,
-    profile_id  INTEGER,
+    repository_id  INTEGER,
     error       TEXT NOT NULL,
     executed_at TIMESTAMPTZ NOT NULL
 );
 """
 
-# Default maximum number of articles scraped per profile per run.
-MAX_SCRAPS_PER_RUN = 50
+# Maximum number of articles scraped per repository per run (when articles already exist in DB).
+MAX_SCRAPS_PER_RUN = 5
 
 
 # ---------------------------------------------------------------------------
@@ -87,16 +89,16 @@ def init_db(conn: psycopg2.extensions.connection) -> None:
     conn.commit()
 
 
-def get_profiles(conn: psycopg2.extensions.connection) -> list[tuple[int, str, dict]]:
-    """Return all profiles as a list of (id, url, config) tuples."""
+def get_repositories(conn: psycopg2.extensions.connection) -> list[tuple[int, str, dict]]:
+    """Return all repositories as a list of (id, url, config) tuples."""
     with conn.cursor() as cur:
-        cur.execute("SELECT id, url, config FROM profile ORDER BY id")
+        cur.execute("SELECT id, url, config FROM repository ORDER BY id")
         return cur.fetchall()
 
 
 def save_entry(
     conn: psycopg2.extensions.connection,
-    profile_id: int,
+    repository_id: int,
     content: str,
     params: dict,
     executed_at: datetime,
@@ -105,17 +107,17 @@ def save_entry(
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO connector_scrap (provider_id, content, params, executed_at, success)
+            INSERT INTO connector_scrap (repository_id, content, params, executed_at, success)
             VALUES (%s, %s, %s, %s, TRUE)
             """,
-            (profile_id, content, json.dumps(params, ensure_ascii=False), executed_at),
+            (repository_id, content, json.dumps(params, ensure_ascii=False), executed_at),
         )
     conn.commit()
 
 
 def save_error(
     conn: psycopg2.extensions.connection,
-    profile_id: int | None,
+    repository_id: int | None,
     error: str,
     executed_at: datetime,
 ) -> None:
@@ -123,22 +125,41 @@ def save_error(
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO log (profile_id, error, executed_at)
+            INSERT INTO log (repository_id, error, executed_at)
             VALUES (%s, %s, %s)
             """,
-            (profile_id, error, executed_at),
+            (repository_id, error, executed_at),
         )
     conn.commit()
 
 
-def is_article_scraped(conn: psycopg2.extensions.connection, profile_id: int, article_url: str) -> bool:
-    """Return True if this article URL was already scraped for the given profile."""
+def has_any_scrap(conn: psycopg2.extensions.connection, repository_id: int) -> bool:
+    """Return True if at least one scraped article exists for the given repository."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT 1 FROM connector_scrap WHERE provider_id = %s AND params->>'url' = %s LIMIT 1",
-            (profile_id, article_url),
+            "SELECT 1 FROM connector_scrap WHERE repository_id = %s LIMIT 1",
+            (repository_id,),
         )
         return cur.fetchone() is not None
+
+
+def is_article_scraped(conn: psycopg2.extensions.connection, repository_id: int, article_url: str) -> bool:
+    """Return True if this article URL was already scraped for the given repository."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM connector_scrap WHERE repository_id = %s AND params->>'url' = %s LIMIT 1",
+            (repository_id, article_url),
+        )
+        return cur.fetchone() is not None
+
+
+def clean_old_scraps(conn: psycopg2.extensions.connection) -> int:
+    """Delete connector_scrap rows older than 15 days. Returns the number of deleted rows."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM connector_scrap WHERE executed_at < NOW() - INTERVAL '15 days'")
+        deleted = cur.rowcount
+    conn.commit()
+    return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -182,56 +203,78 @@ def scrape_page(page_url: str, css_path: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def process_profile(
+def process_repository(
     conn: psycopg2.extensions.connection,
-    profile_id: int,
+    repository_id: int,
     page: str,
     config: dict,
     executed_at: datetime,
 ) -> None:
-    """Scrape blog articles for one profile and persist new results.
+    """Scrape blog articles for one repository and persist new results.
 
-    For each article URL found on the listing page:
-      - Stop if the article URL already exists in the database (duplicate boundary reached).
-      - Stop if the per-run scrape limit is reached.
+    - If no articles exist yet for this repository: saves only the latest article.
+    - Otherwise: iterates articles newest-first, saves new ones, stops at the first
+      already-known article or after max_scraps articles.
     Any exception during listing-page fetch is caught, logged, and printed to stderr.
     Errors on individual articles are logged but do not stop the run.
     """
     try:
         articles_selector = config["articles_selector"]
         content_selector = config.get("content_selector", "body")
-        max_scraps = int(config.get("max_scraps", MAX_SCRAPS_PER_RUN))
+        max_scraps = MAX_SCRAPS_PER_RUN
 
         article_urls = get_article_links(page, articles_selector)
+        if not article_urls:
+            return
 
+        if not has_any_scrap(conn, repository_id):
+            # First time: save only the latest article
+            url = article_urls[0]
+            try:
+                content = scrape_page(url, content_selector)
+                if content is None:
+                    save_error(
+                        conn,
+                        repository_id,
+                        f"No element found at selector '{content_selector}' on {url}",
+                        executed_at,
+                    )
+                else:
+                    save_entry(conn, repository_id, content, {"url": url, **config}, executed_at)
+            except Exception as e:
+                save_error(conn, repository_id, f"Error scraping {url}: {e}", executed_at)
+                print(f"[{url}] Error: {e}", file=sys.stderr)
+            return
+
+        # Articles exist: save new ones until we hit a known one
         scraped_count = 0
         for url in article_urls:
             if scraped_count >= max_scraps:
                 break
 
-            if is_article_scraped(conn, profile_id, url):
-                break  # Already in DB — no need to go further back
+            if is_article_scraped(conn, repository_id, url):
+                break
 
             try:
                 content = scrape_page(url, content_selector)
                 if content is None:
                     save_error(
                         conn,
-                        profile_id,
+                        repository_id,
                         f"No element found at selector '{content_selector}' on {url}",
                         executed_at,
                     )
                     continue
 
-                save_entry(conn, profile_id, content, {"url": url, **config}, executed_at)
+                save_entry(conn, repository_id, content, {"url": url, **config}, executed_at)
                 scraped_count += 1
 
             except Exception as e:
-                save_error(conn, profile_id, f"Error scraping {url}: {e}", executed_at)
+                save_error(conn, repository_id, f"Error scraping {url}: {e}", executed_at)
                 print(f"[{url}] Error: {e}", file=sys.stderr)
 
     except Exception as e:
-        save_error(conn, profile_id, str(e), executed_at)
+        save_error(conn, repository_id, str(e), executed_at)
         print(f"[{page}] Error: {e}", file=sys.stderr)
 
 
@@ -244,16 +287,17 @@ def main() -> None:
     conn = get_db_conn()
     try:
         init_db(conn)
+        clean_old_scraps(conn)
 
-        profiles = get_profiles(conn)
-        if not profiles:
-            print("No profiles tracked. Insert rows into the profile table to add pages.")
+        repositories = get_repositories(conn)
+        if not repositories:
+            print("No repositories tracked. Insert rows into the repository table to add pages.")
             return
 
         executed_at = datetime.now(tz=timezone.utc)
 
-        for profile_id, url, config in profiles:
-            process_profile(conn, profile_id, url, config, executed_at)
+        for repository_id, url, config in repositories:
+            process_repository(conn, repository_id, url, config, executed_at)
 
     finally:
         conn.close()
