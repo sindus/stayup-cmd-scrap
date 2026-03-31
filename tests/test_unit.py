@@ -5,8 +5,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from scrape_pages import (
-    MAX_SCRAPS_PER_RUN,
-    clean_old_scraps,
+    cleanup_old_entries,
     get_article_links,
     get_repositories,
     has_any_scrap,
@@ -175,27 +174,25 @@ class TestIsArticleScraped:
 # ---------------------------------------------------------------------------
 
 
-class TestCleanOldScraps:
+class TestCleanupOldEntries:
     def test_executes_delete_and_commits(self):
         conn, cursor = make_conn_mock()
-        cursor.rowcount = 0
-        clean_old_scraps(conn)
+        cleanup_old_entries(conn, 1, 15)
         cursor.execute.assert_called_once()
         conn.commit.assert_called_once()
 
-    def test_returns_deleted_count(self):
+    def test_uses_repository_id_and_retention_days(self):
         conn, cursor = make_conn_mock()
-        cursor.rowcount = 3
-        result = clean_old_scraps(conn)
-        assert result == 3
+        cleanup_old_entries(conn, 7, 30)
+        params = cursor.execute.call_args[0][1]
+        assert params == (7, 30)
 
-    def test_query_targets_connector_scrap_with_15_day_interval(self):
+    def test_query_targets_connector_scrap(self):
         conn, cursor = make_conn_mock()
-        cursor.rowcount = 0
-        clean_old_scraps(conn)
+        cleanup_old_entries(conn, 1, 15)
         sql = cursor.execute.call_args[0][0]
         assert "connector_scrap" in sql
-        assert "15 days" in sql
+        assert "INTERVAL" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +307,7 @@ class TestProcessRepository:
         mock_has_any.return_value = False
         mock_scrape.return_value = "Article content"
 
-        process_repository(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
+        process_repository(conn, 1, self._url, datetime.now(tz=timezone.utc), self._make_config())
 
         assert mock_scrape.call_count == 1
         mock_scrape.assert_called_once_with("https://blog.example.com/post-3", "article")
@@ -327,7 +324,7 @@ class TestProcessRepository:
         mock_has_any.return_value = True
         mock_is_scraped.return_value = True
 
-        process_repository(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
+        process_repository(conn, 1, self._url, datetime.now(tz=timezone.utc), self._make_config())
 
         mock_scrape.assert_not_called()
 
@@ -339,14 +336,14 @@ class TestProcessRepository:
         from scrape_pages import process_repository
 
         conn, _ = make_conn_mock()
-        mock_links.return_value = [f"https://blog.example.com/post-{i}" for i in range(MAX_SCRAPS_PER_RUN + 5)]
+        mock_links.return_value = [f"https://blog.example.com/post-{i}" for i in range(10)]
         mock_has_any.return_value = True
         mock_is_scraped.return_value = False
         mock_scrape.return_value = "Content"
 
-        process_repository(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
+        process_repository(conn, 1, self._url, datetime.now(tz=timezone.utc), self._make_config())
 
-        assert mock_scrape.call_count == MAX_SCRAPS_PER_RUN
+        assert mock_scrape.call_count == 5
 
     @patch("scrape_pages.scrape_page")
     @patch("scrape_pages.is_article_scraped")
@@ -366,7 +363,7 @@ class TestProcessRepository:
         mock_is_scraped.side_effect = [False, True]
         mock_scrape.return_value = "Content"
 
-        process_repository(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
+        process_repository(conn, 1, self._url, datetime.now(tz=timezone.utc), self._make_config())
 
         assert mock_scrape.call_count == 1
         mock_scrape.assert_called_once_with("https://blog.example.com/post-3", "article")
@@ -382,7 +379,7 @@ class TestProcessRepository:
         mock_has_any.return_value = False
         mock_scrape.return_value = None  # Selector found nothing
 
-        process_repository(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
+        process_repository(conn, 1, self._url, datetime.now(tz=timezone.utc), self._make_config())
 
         # An error row should have been inserted (save_error calls cursor.execute)
         assert cursor.execute.call_count >= 1
@@ -394,7 +391,7 @@ class TestProcessRepository:
         conn, cursor = make_conn_mock()
         mock_links.side_effect = Exception("connection timeout")
 
-        process_repository(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
+        process_repository(conn, 1, self._url, datetime.now(tz=timezone.utc), self._make_config())
 
         # save_error must have been called
         assert cursor.execute.call_count >= 1
@@ -415,7 +412,7 @@ class TestProcessRepository:
         mock_is_scraped.return_value = False
         mock_scrape.side_effect = [Exception("timeout"), "Content of post 2"]
 
-        process_repository(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
+        process_repository(conn, 1, self._url, datetime.now(tz=timezone.utc), self._make_config())
 
         # Second article was still scraped despite first failing
         assert mock_scrape.call_count == 2
@@ -427,7 +424,7 @@ class TestProcessRepository:
         conn, cursor = make_conn_mock()
         mock_links.return_value = []
 
-        process_repository(conn, 1, self._url, self._make_config(), datetime.now(tz=timezone.utc))
+        process_repository(conn, 1, self._url, datetime.now(tz=timezone.utc), self._make_config())
 
         # No DB writes should happen
         conn.commit.assert_not_called()

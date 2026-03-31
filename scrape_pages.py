@@ -5,9 +5,9 @@ Stayup — scrapes blog articles defined in the repository table and stores resu
 For each repository, the script fetches the listing page and extracts article URLs:
   - If no articles exist yet for this repository: saves only the latest article.
   - Otherwise: saves new articles (newest first) until a known article is found,
-    up to MAX_SCRAPS_PER_RUN articles per run.
+    up to config["max_scraps"] (default 5) articles per run.
 
-A cleanup step removes connector_scrap entries older than 15 days.
+A cleanup step removes connector_scrap entries older than config["retention_days"] (default 15) days.
 
 Repository table columns:
   url     TEXT   — listing page URL to scrape
@@ -55,9 +55,6 @@ CREATE TABLE IF NOT EXISTS log (
     executed_at TIMESTAMPTZ NOT NULL
 );
 """
-
-# Maximum number of articles scraped per repository per run (when articles already exist in DB).
-MAX_SCRAPS_PER_RUN = 5
 
 
 # ---------------------------------------------------------------------------
@@ -154,13 +151,14 @@ def is_article_scraped(conn: psycopg2.extensions.connection, repository_id: int,
         return cur.fetchone() is not None
 
 
-def clean_old_scraps(conn: psycopg2.extensions.connection) -> int:
-    """Delete connector_scrap rows older than 15 days. Returns the number of deleted rows."""
+def cleanup_old_entries(conn: psycopg2.extensions.connection, repository_id: int, retention_days: int) -> None:
+    """Delete connector_scrap rows for a repository older than retention_days days."""
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM connector_scrap WHERE executed_at < NOW() - INTERVAL '15 days'")
-        deleted = cur.rowcount
+        cur.execute(
+            "DELETE FROM connector_scrap WHERE repository_id = %s AND executed_at < NOW() - %s * INTERVAL '1 day'",
+            (repository_id, retention_days),
+        )
     conn.commit()
-    return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -207,9 +205,9 @@ def scrape_page(page_url: str, css_path: str) -> str | None:
 def process_repository(
     conn: psycopg2.extensions.connection,
     repository_id: int,
-    page: str,
-    config: dict,
+    repository_url: str,
     executed_at: datetime,
+    config: dict,
 ) -> None:
     """Scrape blog articles for one repository and persist new results.
 
@@ -222,9 +220,9 @@ def process_repository(
     try:
         articles_selector = config["articles_selector"]
         content_selector = config.get("content_selector", "body")
-        max_scraps = MAX_SCRAPS_PER_RUN
+        max_scraps = config.get("max_scraps", 5)
 
-        article_urls = get_article_links(page, articles_selector)
+        article_urls = get_article_links(repository_url, articles_selector)
         if not article_urls:
             return
 
@@ -276,7 +274,7 @@ def process_repository(
 
     except Exception as e:
         save_error(conn, repository_id, str(e), executed_at)
-        print(f"[{page}] Error: {e}", file=sys.stderr)
+        print(f"[{repository_url}] Error: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -288,17 +286,17 @@ def main() -> None:
     conn = get_db_conn()
     try:
         init_db(conn)
-        clean_old_scraps(conn)
 
         repositories = get_repositories(conn)
         if not repositories:
-            print("No repositories tracked. Insert rows into the repository table to add pages.")
+            print("No repositories tracked. Use --add <url> to add one.")
             return
 
         executed_at = datetime.now(tz=timezone.utc)
 
-        for repository_id, url, config in repositories:
-            process_repository(conn, repository_id, url, config, executed_at)
+        for repository_id, repository_url, config in repositories:
+            process_repository(conn, repository_id, repository_url, executed_at, config)
+            cleanup_old_entries(conn, repository_id, config.get("retention_days", 15))
 
     finally:
         conn.close()

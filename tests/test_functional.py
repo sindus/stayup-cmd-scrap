@@ -14,8 +14,7 @@ import psycopg2
 import pytest
 
 from scrape_pages import (
-    MAX_SCRAPS_PER_RUN,
-    clean_old_scraps,
+    cleanup_old_entries,
     get_repositories,
     has_any_scrap,
     init_db,
@@ -248,16 +247,15 @@ class TestIsArticleScrapedFunctional:
 # ---------------------------------------------------------------------------
 
 
-class TestCleanOldScrapsFunctional:
-    def test_deletes_entries_older_than_15_days(self, db_conn):
+class TestCleanupOldEntriesFunctional:
+    def test_deletes_entries_older_than_retention_days(self, db_conn):
         repository_id = insert_repository(db_conn, DEFAULT_URL, make_config())
         old_date = datetime.now(tz=timezone.utc) - timedelta(days=16)
         save_entry(db_conn, repository_id, "old article", {"url": "https://blog.example.com/old-1"}, old_date)
         save_entry(db_conn, repository_id, "old article 2", {"url": "https://blog.example.com/old-2"}, old_date)
 
-        deleted = clean_old_scraps(db_conn)
+        cleanup_old_entries(db_conn, repository_id, 15)
 
-        assert deleted == 2
         with db_conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM connector_scrap WHERE repository_id = %s", (repository_id,))
             count = cur.fetchone()[0]
@@ -268,9 +266,8 @@ class TestCleanOldScrapsFunctional:
         recent_date = datetime.now(tz=timezone.utc) - timedelta(days=10)
         save_entry(db_conn, repository_id, "recent", {"url": "https://blog.example.com/recent"}, recent_date)
 
-        deleted = clean_old_scraps(db_conn)
+        cleanup_old_entries(db_conn, repository_id, 15)
 
-        assert deleted == 0
         with db_conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM connector_scrap WHERE repository_id = %s", (repository_id,))
             count = cur.fetchone()[0]
@@ -283,17 +280,20 @@ class TestCleanOldScrapsFunctional:
         save_entry(db_conn, repository_id, "old", {"url": "https://blog.example.com/old"}, old_date)
         save_entry(db_conn, repository_id, "recent", {"url": "https://blog.example.com/recent"}, recent_date)
 
-        deleted = clean_old_scraps(db_conn)
+        cleanup_old_entries(db_conn, repository_id, 15)
 
-        assert deleted == 1
         with db_conn.cursor() as cur:
             cur.execute("SELECT content FROM connector_scrap WHERE repository_id = %s", (repository_id,))
             row = cur.fetchone()
         assert row[0] == "recent"
 
-    def test_returns_zero_when_nothing_to_delete(self, db_conn):
-        deleted = clean_old_scraps(db_conn)
-        assert deleted == 0
+    def test_does_nothing_when_no_old_entries(self, db_conn):
+        repository_id = insert_repository(db_conn, DEFAULT_URL, make_config())
+        cleanup_old_entries(db_conn, repository_id, 15)
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM connector_scrap WHERE repository_id = %s", (repository_id,))
+            count = cur.fetchone()[0]
+        assert count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +315,7 @@ class TestEndToEnd:
         config = make_config()
         repository_id = insert_repository(db_conn, DEFAULT_URL, config)
 
-        process_repository(db_conn, repository_id, DEFAULT_URL, config, datetime.now(tz=timezone.utc))
+        process_repository(db_conn, repository_id, DEFAULT_URL, datetime.now(tz=timezone.utc), config)
 
         with db_conn.cursor() as cur:
             cur.execute(
@@ -339,16 +339,16 @@ class TestEndToEnd:
         save_entry(db_conn, repository_id, "existing", {"url": existing_url}, datetime.now(tz=timezone.utc))
 
         # Mock more new articles than MAX_SCRAPS_PER_RUN, followed by the existing one
-        new_urls = [f"https://blog.example.com/post-{i}" for i in range(MAX_SCRAPS_PER_RUN + 5, 0, -1)]
+        new_urls = [f"https://blog.example.com/post-{i}" for i in range(10, 0, -1)]
         mock_links.return_value = new_urls + [existing_url]
         mock_scrape.return_value = "Content"
 
-        process_repository(db_conn, repository_id, DEFAULT_URL, config, datetime.now(tz=timezone.utc))
+        process_repository(db_conn, repository_id, DEFAULT_URL, datetime.now(tz=timezone.utc), config)
 
         with db_conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM connector_scrap WHERE repository_id = %s", (repository_id,))
             count = cur.fetchone()[0]
-        assert count == 1 + MAX_SCRAPS_PER_RUN  # 1 pre-existing + MAX_SCRAPS_PER_RUN new
+        assert count == 1 + 5  # 1 pre-existing + max_scraps (default 5) new
 
     @patch("scrape_pages.scrape_page")
     @patch("scrape_pages.get_article_links")
@@ -361,7 +361,7 @@ class TestEndToEnd:
 
         mock_links.return_value = [url, "https://blog.example.com/post-2"]
 
-        process_repository(db_conn, repository_id, DEFAULT_URL, config, datetime.now(tz=timezone.utc))
+        process_repository(db_conn, repository_id, DEFAULT_URL, datetime.now(tz=timezone.utc), config)
 
         mock_scrape.assert_not_called()
 
@@ -382,10 +382,10 @@ class TestEndToEnd:
         mock_scrape.return_value = "Content"
 
         # First run — article is new, no existing scraps
-        process_repository(db_conn, repository_id, DEFAULT_URL, config, datetime.now(tz=timezone.utc))
+        process_repository(db_conn, repository_id, DEFAULT_URL, datetime.now(tz=timezone.utc), config)
 
         # Second run — same listing, article already in DB
-        process_repository(db_conn, repository_id, DEFAULT_URL, config, datetime.now(tz=timezone.utc))
+        process_repository(db_conn, repository_id, DEFAULT_URL, datetime.now(tz=timezone.utc), config)
 
         with db_conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM connector_scrap WHERE repository_id = %s", (repository_id,))
@@ -398,7 +398,7 @@ class TestEndToEnd:
         config = make_config()
         repository_id = insert_repository(db_conn, DEFAULT_URL, config)
 
-        process_repository(db_conn, repository_id, DEFAULT_URL, config, datetime.now(tz=timezone.utc))
+        process_repository(db_conn, repository_id, DEFAULT_URL, datetime.now(tz=timezone.utc), config)
 
         with db_conn.cursor() as cur:
             cur.execute("SELECT error FROM log WHERE repository_id = %s", (repository_id,))
@@ -413,7 +413,7 @@ class TestEndToEnd:
         config = make_config()
         repository_id = insert_repository(db_conn, DEFAULT_URL, config)
 
-        process_repository(db_conn, repository_id, DEFAULT_URL, config, datetime.now(tz=timezone.utc))
+        process_repository(db_conn, repository_id, DEFAULT_URL, datetime.now(tz=timezone.utc), config)
 
         with db_conn.cursor() as cur:
             cur.execute("SELECT error FROM log WHERE repository_id = %s", (repository_id,))
