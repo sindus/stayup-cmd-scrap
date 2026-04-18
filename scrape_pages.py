@@ -92,10 +92,7 @@ def get_repositories(conn: psycopg2.extensions.connection) -> list[tuple[int, st
     with conn.cursor() as cur:
         cur.execute("SELECT id, url, config FROM repository WHERE type = 'scrap' ORDER BY id")
         rows = cur.fetchall()
-        return [
-            (row[0], row[1], json.loads(row[2]) if isinstance(row[2], str) else (row[2] or {}))
-            for row in rows
-        ]
+        return [(row[0], row[1], json.loads(row[2]) if isinstance(row[2], str) else (row[2] or {})) for row in rows]
 
 
 def save_entry(
