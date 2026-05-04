@@ -15,6 +15,7 @@ Repository table columns:
     {
       "articles_selector":  "h2.post-title a",       # CSS selector for article links
       "content_selector":   "article.post-content",  # CSS selector for article body (optional, default: "body")
+      "exclude":            ["div.ads", ".sidebar"], # CSS selectors to remove before extracting text (optional)
     }
 """
 
@@ -184,10 +185,11 @@ def get_article_links(page_url: str, articles_selector: str) -> list[str]:
     return links
 
 
-def scrape_page(page_url: str, css_path: str) -> str | None:
+def scrape_page(page_url: str, css_path: str, exclude_selectors: list[str] | None = None) -> str | None:
     """Fetch a page and return the text content of the element matching css_path.
 
-    Returns None if no element matches the selector.
+    Excluded elements (matched by exclude_selectors) are removed before text extraction.
+    Returns None if no element matches css_path.
     """
     resp = requests.get(page_url, timeout=30, headers={"User-Agent": "stayup-scrap/1.0"})
     resp.raise_for_status()
@@ -195,6 +197,9 @@ def scrape_page(page_url: str, css_path: str) -> str | None:
     element = soup.select_one(css_path)
     if element is None:
         return None
+    for selector in exclude_selectors or []:
+        for excluded in element.select(selector):
+            excluded.decompose()
     return element.get_text(separator="\n", strip=True)
 
 
@@ -221,6 +226,7 @@ def process_repository(
     try:
         articles_selector = config["articles_selector"]
         content_selector = config.get("content_selector", "body")
+        exclude_selectors = config.get("exclude", [])
         max_scraps = config.get("max_scraps", 5)
 
         article_urls = get_article_links(repository_url, articles_selector)
@@ -231,7 +237,7 @@ def process_repository(
             # First time: save only the latest article
             url = article_urls[0]
             try:
-                content = scrape_page(url, content_selector)
+                content = scrape_page(url, content_selector, exclude_selectors)
                 if content is None:
                     save_error(
                         conn,
@@ -256,7 +262,7 @@ def process_repository(
                 break
 
             try:
-                content = scrape_page(url, content_selector)
+                content = scrape_page(url, content_selector, exclude_selectors)
                 if content is None:
                     save_error(
                         conn,

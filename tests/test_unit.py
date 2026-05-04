@@ -275,6 +275,45 @@ class TestScrapePage:
         except Exception as e:
             assert "404" in str(e)
 
+    @patch("scrape_pages.requests.get")
+    def test_exclude_selectors_removed_from_content(self, mock_get):
+        mock_get.return_value.text = (
+            "<html><body><main>"
+            "<p>Real content</p>"
+            '<div class="ads">Ad banner</div>'
+            '<span class="sidebar">Sidebar</span>'
+            "</main></body></html>"
+        )
+        mock_get.return_value.raise_for_status = MagicMock()
+        result = scrape_page("https://example.com", "main", ["div.ads", ".sidebar"])
+        assert "Real content" in result
+        assert "Ad banner" not in result
+        assert "Sidebar" not in result
+
+    @patch("scrape_pages.requests.get")
+    def test_exclude_selectors_only_within_content_element(self, mock_get):
+        mock_get.return_value.text = (
+            "<html><body>"
+            '<div class="ads">Outside ads</div>'
+            "<main><p>Content</p></main>"
+            "</body></html>"
+        )
+        mock_get.return_value.raise_for_status = MagicMock()
+        result = scrape_page("https://example.com", "main", ["div.ads"])
+        assert result == "Content"
+
+    @patch("scrape_pages.requests.get")
+    def test_empty_exclude_list_behaves_like_no_exclusions(self, mock_get):
+        mock_get.return_value.text = "<html><body><main><p>Hello</p></main></body></html>"
+        mock_get.return_value.raise_for_status = MagicMock()
+        assert scrape_page("https://example.com", "main", []) == "Hello"
+
+    @patch("scrape_pages.requests.get")
+    def test_none_exclude_behaves_like_no_exclusions(self, mock_get):
+        mock_get.return_value.text = "<html><body><main><p>Hello</p></main></body></html>"
+        mock_get.return_value.raise_for_status = MagicMock()
+        assert scrape_page("https://example.com", "main", None) == "Hello"
+
 
 # ---------------------------------------------------------------------------
 # process_repository
@@ -310,7 +349,7 @@ class TestProcessRepository:
         process_repository(conn, 1, self._url, datetime.now(tz=timezone.utc), self._make_config())
 
         assert mock_scrape.call_count == 1
-        mock_scrape.assert_called_once_with("https://blog.example.com/post-3", "article")
+        mock_scrape.assert_called_once_with("https://blog.example.com/post-3", "article", [])
 
     @patch("scrape_pages.scrape_page")
     @patch("scrape_pages.is_article_scraped")
@@ -366,7 +405,7 @@ class TestProcessRepository:
         process_repository(conn, 1, self._url, datetime.now(tz=timezone.utc), self._make_config())
 
         assert mock_scrape.call_count == 1
-        mock_scrape.assert_called_once_with("https://blog.example.com/post-3", "article")
+        mock_scrape.assert_called_once_with("https://blog.example.com/post-3", "article", [])
 
     @patch("scrape_pages.scrape_page")
     @patch("scrape_pages.has_any_scrap")
@@ -428,3 +467,19 @@ class TestProcessRepository:
 
         # No DB writes should happen
         conn.commit.assert_not_called()
+
+    @patch("scrape_pages.scrape_page")
+    @patch("scrape_pages.has_any_scrap")
+    @patch("scrape_pages.get_article_links")
+    def test_passes_exclude_selectors_from_config(self, mock_links, mock_has_any, mock_scrape):
+        from scrape_pages import process_repository
+
+        conn, _ = make_conn_mock()
+        mock_links.return_value = ["https://blog.example.com/post-1"]
+        mock_has_any.return_value = False
+        mock_scrape.return_value = "Content"
+
+        config = {**self._make_config(), "exclude": ["div.ads", ".comments"]}
+        process_repository(conn, 1, self._url, datetime.now(tz=timezone.utc), config)
+
+        mock_scrape.assert_called_once_with("https://blog.example.com/post-1", "article", ["div.ads", ".comments"])
