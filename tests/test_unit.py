@@ -293,10 +293,7 @@ class TestScrapePage:
     @patch("scrape_pages.requests.get")
     def test_exclude_selectors_only_within_content_element(self, mock_get):
         mock_get.return_value.text = (
-            "<html><body>"
-            '<div class="ads">Outside ads</div>'
-            "<main><p>Content</p></main>"
-            "</body></html>"
+            "<html><body>" '<div class="ads">Outside ads</div>' "<main><p>Content</p></main>" "</body></html>"
         )
         mock_get.return_value.raise_for_status = MagicMock()
         result = scrape_page("https://example.com", "main", ["div.ads"])
